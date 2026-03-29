@@ -8,6 +8,7 @@ import json
 import base64
 import asyncio
 import logging
+import httpx
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
@@ -21,7 +22,68 @@ logger = logging.getLogger(__name__)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_WS_URL = f"wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key={GEMINI_API_KEY}"
 
-SYSTEM_PROMPT = """Du bist Jeff, KI-Assistent von Hendric Martens (HalloPetra GmbH, KI für Handwerker). Antworte kurz auf Deutsch. Du sprichst gerade per Telefon."""
+# OpenClaw webhook for Telegram notifications
+OPENCLAW_HOOK_URL = os.getenv("OPENCLAW_HOOK_URL", "https://openclaw-production-adb5.up.railway.app/hooks/wake")
+OPENCLAW_HOOK_TOKEN = os.getenv("OPENCLAW_HOOK_TOKEN", "")
+
+SYSTEM_PROMPT = """Du bist Jeff, KI-Assistent von Hendric Martens (HalloPetra GmbH, KI für Handwerker). Antworte kurz auf Deutsch. Du sprichst gerade per Telefon.
+
+Du hast ein Tool: send_telegram_message
+- Benutze es wenn Hendric dich bittet, ihm eine Nachricht zu schicken oder eine Erinnerung zu erstellen
+- Auch wenn er sagt "schreib dir das auf" oder "erinnere mich daran" oder "schick das an Jeff"
+- Die Nachricht landet direkt in seinem Telegram Chat
+- Bestätige kurz per Sprache dass du die Nachricht abgeschickt hast"""
+
+
+# Gemini function declaration for send_telegram_message
+SEND_TELEGRAM_TOOL = {
+    "name": "send_telegram_message",
+    "description": "Sendet eine Nachricht an Hendric's Telegram Chat. Benutzen wenn er eine Erinnerung, Notiz oder Nachricht haben möchte.",
+    "parameters": {
+        "type": "OBJECT",
+        "properties": {
+            "message": {
+                "type": "STRING",
+                "description": "Die Nachricht die an Telegram gesendet werden soll. Klar und präzise formuliert."
+            }
+        },
+        "required": ["message"]
+    }
+}
+
+
+async def send_telegram_message(message: str) -> str:
+    """Send a message to Hendric's Telegram via OpenClaw webhook."""
+    logger.info(f"Sending Telegram message: {message}")
+    
+    if not OPENCLAW_HOOK_TOKEN:
+        logger.error("OPENCLAW_HOOK_TOKEN not set, cannot send Telegram message")
+        return "Fehler: Kein Webhook-Token konfiguriert"
+    
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                OPENCLAW_HOOK_URL,
+                headers={
+                    "Authorization": f"Bearer {OPENCLAW_HOOK_TOKEN}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "text": f"📱 Nachricht vom Telefonat:\n\n{message}",
+                    "mode": "now"
+                }
+            )
+            
+            if response.status_code == 200:
+                logger.info(f"Telegram message sent successfully: {message}")
+                return "Nachricht erfolgreich gesendet"
+            else:
+                logger.error(f"Failed to send Telegram message: {response.status_code} {response.text}")
+                return f"Fehler beim Senden: {response.status_code}"
+                
+    except Exception as e:
+        logger.error(f"Exception sending Telegram message: {e}")
+        return f"Fehler: {e}"
 
 
 @asynccontextmanager
@@ -30,6 +92,10 @@ async def lifespan(app: FastAPI):
     logger.info("Gemini Voice Bridge starting up...")
     if not GEMINI_API_KEY:
         logger.warning("GEMINI_API_KEY not set!")
+    if not OPENCLAW_HOOK_TOKEN:
+        logger.warning("OPENCLAW_HOOK_TOKEN not set - send_telegram_message tool will not work!")
+    else:
+        logger.info(f"OpenClaw webhook configured: {OPENCLAW_HOOK_URL}")
     yield
     logger.info("Gemini Voice Bridge shutting down...")
 
@@ -40,7 +106,7 @@ app = FastAPI(title="Gemini Voice Bridge", lifespan=lifespan)
 @app.get("/health")
 async def health_check():
     """Health check endpoint for Railway."""
-    return {"status": "healthy", "service": "gemini-voice-bridge"}
+    return {"status": "ok", "service": "gemini-voice-bridge"}
 
 
 @app.post("/voice/webhook")
@@ -76,7 +142,6 @@ async def media_stream(websocket: WebSocket):
     await websocket.accept()
     logger.info("Twilio media stream connected")
     
-    stream_sid = None
     gemini_ws = None
     
     try:
@@ -84,7 +149,7 @@ async def media_stream(websocket: WebSocket):
         gemini_ws = await websockets.connect(GEMINI_WS_URL)
         logger.info("Connected to Gemini Live API")
         
-        # Send initial setup message to Gemini
+        # Send initial setup message to Gemini with tools
         setup_message = {
             "setup": {
                 "model": "models/gemini-2.0-flash-exp",
@@ -100,10 +165,16 @@ async def media_stream(websocket: WebSocket):
                 },
                 "systemInstruction": {
                     "parts": [{"text": SYSTEM_PROMPT}]
-                }
+                },
+                "tools": [
+                    {
+                        "functionDeclarations": [SEND_TELEGRAM_TOOL]
+                    }
+                ]
             }
         }
         await gemini_ws.send(json.dumps(setup_message))
+        logger.info("Sent setup with send_telegram_message tool")
         
         # Wait for setup complete
         setup_response = await gemini_ws.recv()
@@ -163,9 +234,6 @@ async def handle_twilio_to_gemini(twilio_ws: WebSocket, gemini_ws):
                 # Extract audio payload (base64 encoded mulaw)
                 payload = data.get("media", {}).get("payload")
                 if payload:
-                    # Send audio to Gemini
-                    # Gemini expects PCM audio, but let's try with mulaw first
-                    # and convert if needed
                     audio_message = {
                         "realtimeInput": {
                             "mediaChunks": [{
@@ -189,15 +257,55 @@ async def handle_twilio_to_gemini(twilio_ws: WebSocket, gemini_ws):
 async def handle_gemini_to_twilio(twilio_ws: WebSocket, gemini_ws):
     """
     Receives audio responses from Gemini and forwards to Twilio.
-    Converts Gemini's audio format to mulaw 8kHz for Twilio.
+    Also handles function calls (send_telegram_message).
     """
     try:
         while True:
             response = await gemini_ws.recv()
             data = json.loads(response)
             
+            # Handle function calls from Gemini
+            if "toolCall" in data:
+                tool_call = data["toolCall"]
+                function_calls = tool_call.get("functionCalls", [])
+                
+                tool_responses = []
+                for fc in function_calls:
+                    fc_name = fc.get("name")
+                    fc_id = fc.get("id")
+                    fc_args = fc.get("args", {})
+                    
+                    logger.info(f"Tool call received: {fc_name} with args: {fc_args}")
+                    
+                    if fc_name == "send_telegram_message":
+                        message = fc_args.get("message", "")
+                        result = await send_telegram_message(message)
+                        logger.info(f"send_telegram_message result: {result}")
+                        tool_responses.append({
+                            "id": fc_id,
+                            "name": fc_name,
+                            "response": {"result": result}
+                        })
+                    else:
+                        logger.warning(f"Unknown tool call: {fc_name}")
+                        tool_responses.append({
+                            "id": fc_id,
+                            "name": fc_name,
+                            "response": {"result": "Unbekanntes Tool"}
+                        })
+                
+                # Send tool responses back to Gemini
+                if tool_responses:
+                    tool_response_msg = {
+                        "toolResponse": {
+                            "functionResponses": tool_responses
+                        }
+                    }
+                    await gemini_ws.send(json.dumps(tool_response_msg))
+                    logger.info(f"Sent {len(tool_responses)} tool response(s) to Gemini")
+            
             # Check for audio data in response
-            if "serverContent" in data:
+            elif "serverContent" in data:
                 server_content = data["serverContent"]
                 
                 # Check if model is done speaking
@@ -216,11 +324,9 @@ async def handle_gemini_to_twilio(twilio_ws: WebSocket, gemini_ws):
                         audio_data = inline_data.get("data", "")
                         
                         if audio_data and "audio" in mime_type:
-                            # Send audio back to Twilio
-                            # Note: May need audio conversion here
                             twilio_message = {
                                 "event": "media",
-                                "streamSid": "",  # Will be populated
+                                "streamSid": "",
                                 "media": {
                                     "payload": audio_data
                                 }
